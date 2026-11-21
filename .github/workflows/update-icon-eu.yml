@@ -1,0 +1,115 @@
+name: Mise à jour ICON-EU 7 km
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Reconstruire même si ce calcul est déjà publié
+        type: boolean
+        default: false
+  schedule:
+    # Runs 00/06/12/18 UTC (complets à +120 h) publiés par le DWD vers +4 h 30 : passage 5 h après chaque run.
+    - cron: "40 5,11,17,23 * * *"
+permissions:
+  contents: write
+concurrency:
+  group: update-icon-eu-data
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Installer les outils GRIB
+        run: python -m pip install -r requirements.txt
+      - name: Vérifier les calculs météo
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Construire les prévisions DWD ICON-EU
+        env:
+          FORCE: ${{ inputs.force }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          args=()
+          if [ "$FORCE" = 'true' ]; then args+=(--force); fi
+          # Coupures passagères de la source (connexion fermée, 429/5xx, délai dépassé) : jusqu'à 3 tentatives.
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if python scripts/update_icon_eu.py --repository "$REPOSITORY" "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/tentative.log"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ] || ! grep -qiE 'RemoteDisconnected|Connection(Error|Reset|refused| aborted)|IncompleteRead|ReadTimeout|ConnectTimeout|ChunkedEncodingError|ProtocolError|Max retries exceeded|Temporary failure in name resolution|Name or service not known|SSLError|HTTP ?(Error)?:? ?(429|500|502|503|504)|(429|502|503|504) (Too Many|Bad Gateway|Service Unavailable|Gateway Time|Server)|Server is busy|ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|timed out|Read timed' "$RUNNER_TEMP/tentative.log"; then
+              echo "::error::Échec (tentative $attempt)"
+              exit 1
+            fi
+            echo "Erreur réseau passagère (tentative $attempt), nouvelle tentative dans 90 s"
+            sleep 90
+          done
+      - name: Vérifier la publication nationale
+        id: validate
+        run: |
+          if [ ! -f build/national/index.json ]; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo 'Le dernier calcul complet est déjà publié.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from update_icon_eu import validate_product
+          validate_product(Path('build/national'))
+          PY
+          echo 'publish=true' >> "$GITHUB_OUTPUT"
+      - name: Publier la branche data
+        if: steps.validate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          source_dir="$PWD/build/national"
+          publish_dir="$(mktemp -d)"
+          git -C "$publish_dir" init -b data
+          git -C "$publish_dir" remote add origin "https://github.com/$REPOSITORY.git"
+          git -C "$publish_dir" config credential.helper "!f() { if [ \"\$1\" = get ]; then echo username=x-access-token; echo password=\$GH_TOKEN; fi; }; f"
+          git -C "$publish_dir" config user.name 'github-actions[bot]'
+          git -C "$publish_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for attempt in 1 2 3 4; do
+            if git ls-remote --exit-code --heads "https://github.com/$REPOSITORY.git" data >/dev/null; then
+              git -C "$publish_dir" fetch --depth=1 origin data
+              git -C "$publish_dir" reset --hard FETCH_HEAD
+              decision="$(python - "$source_dir/index.json" "$publish_dir/index.json" <<'PY'
+          import json, sys
+          def publication_key(path):
+              data = json.load(open(path, encoding='utf-8'))
+              model = data.get('model') if isinstance(data.get('model'), dict) else {}
+              return (model.get('run_time') or data.get('model_run', ''),
+                      model.get('pipeline_version') or data.get('pipeline_version', ''))
+          print('skip' if publication_key(sys.argv[2]) >= publication_key(sys.argv[1]) else 'publish')
+          PY
+              )"
+              if [ "$decision" = 'skip' ]; then
+                echo 'Une publication identique ou plus récente est déjà présente : elle est conservée.' >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              git -C "$publish_dir" rm -r --ignore-unmatch .
+            fi
+            cp -a "$source_dir/." "$publish_dir/"
+            touch "$publish_dir/.nojekyll"
+            # Commit sans parent (branche orpheline) : la branche data ne garde qu'une seule publication,
+            # sinon l'historique grossit de plusieurs dizaines de Mo à chaque passage (dépôt à 3,2 Go en 2026-10).
+            git -C "$publish_dir" checkout -q --orphan "publication-$attempt"
+            git -C "$publish_dir" add --all
+            git -C "$publish_dir" commit -m "Prévisions ICON-EU $(date -u +'%Y-%m-%d %H:%M UTC')"
+            if git -C "$publish_dir" push --force origin HEAD:data; then
+              echo "Prévisions publiées dans https://github.com/$REPOSITORY/tree/data" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "La branche data a changé ; nouvelle tentative $attempt/4."
+            sleep $((attempt * 2))
+          done
+          echo 'Échec après quatre tentatives concurrentes.' >&2
+          exit 1
