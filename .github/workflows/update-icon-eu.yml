@@ -97,7 +97,9 @@ jobs:
               model = data.get('model') if isinstance(data.get('model'), dict) else {}
               return (model.get('run_time') or data.get('model_run', ''),
                       model.get('pipeline_version') or data.get('pipeline_version', ''))
-          print('skip' if publication_key(sys.argv[2]) >= publication_key(sys.argv[1]) else 'publish')
+          import os
+          wp = os.path.isdir(os.path.join(os.path.dirname(sys.argv[2]), 'wp'))
+          print('skip' if wp and publication_key(sys.argv[2]) >= publication_key(sys.argv[1]) else 'publish')
           PY
               )"
               if [ "$decision" = 'skip' ]; then
