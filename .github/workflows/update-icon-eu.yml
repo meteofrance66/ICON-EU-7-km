@@ -48,6 +48,15 @@ jobs:
             echo "Erreur réseau passagère (tentative $attempt), nouvelle tentative dans 90 s"
             sleep 90
           done
+      - name: Cartes et fichiers du module WordPress (format historique, dossier wp/)
+        if: hashFiles('build/national/index.json') != ''
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python -m pip install -r legacy/requirements.txt
+          set -o pipefail
+          python legacy/scripts/update_icon_eu_legacy.py --catalog legacy/config/communes-france.json --output-dir build/national/wp --repository "$REPOSITORY" --force
+          test -f build/national/wp/maps/manifest.json
       - name: Vérifier la publication nationale
         id: validate
         run: |
